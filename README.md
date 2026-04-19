@@ -2,40 +2,22 @@
 
 A production-focused **gsd-pi extension** that combines four high-impact workflows in one package:
 
-- **Double Esc stop** for fast interruption (`Esc Esc` → `/gsd stop`)
+- **Esc stop** for fast interruption (`Esc` → `/gsd stop`, `F4` fallback)
 - **OpenAI / OpenAI Codex WHAM usage footer** (`5h` + `7d` windows)
 - **OpenAI Codex multi-account switching** (`/swap`, `F2` account picker)
-- **Drag & drop screenshot/file session cache** with stable markers like `[Image #1]`
+- **Drag & drop screenshot/file cache** with stable markers like `[Image #1]`
 
-If you are searching for keywords like **"gsd extension"**, **"OpenAI Codex multi account"**, **"terminal drag and drop image to AI"**, **"double esc stop gsd"**, or **"ChatGPT WHAM usage footer"**, this project is built for that exact workflow.
-
----
-
-## Screenshot
-
-![GSD Utility Extension WHAM Usage Footer](https://i.ibb.co/S7449qTL/Ekran-Resmi-2026-04-19-17-20-05.png)
-
----
-
-## Why this extension exists
-
-When working in `gsd` sessions, speed and reliability matter:
-
-- You need an instant way to stop auto mode.
-- You want visible token/usage windows in the terminal footer.
-- You may use multiple OpenAI Codex accounts in one workflow.
-- Dragged screenshot paths from temporary folders can disappear before tools read them.
-
-This extension solves all of that in one install.
+If you are searching for keywords like **"gsd extension"**, **"OpenAI Codex multi account"**, **"terminal drag and drop image to AI"**, **"Esc stop gsd"**, or **"ChatGPT WHAM usage footer"**, this project is built for that exact workflow.
 
 ---
 
 ## Features
 
-## 1) Double Esc Stop (Fast Interrupt)
+## 1) Esc Stop (Fast Interrupt)
 
-- Detects double Escape (`Esc Esc`, typically `ctrl+alt+[`)
+- Detects `Esc` key press
 - Sends `/gsd stop` automatically
+- Keeps `F4` as fallback shortcut
 - Useful when auto mode or a long flow needs immediate stop
 
 ## 2) WHAM Usage Footer (OpenAI / OpenAI-Codex)
@@ -58,78 +40,43 @@ This extension solves all of that in one install.
   - `F2` quick picker (`←/→`, `↑/↓`, `1..9`, `Enter`, `Esc`)
 - Footer badges show active/available accounts: `[1] [2] [3] ...`
 
-## 4) Drag & Drop Session Temp Cache (Images + Files)
+## 4) Drag & Drop Temp Cache (Images + Files)
 
 - Intercepts dragged file paths in terminal input
-- Immediately copies files to a **session temp directory**
+- Immediately copies files to extension-managed temp cache
 - Replaces raw paths with stable markers:
   - Image files → `[Image #1]`, `[Image #2]`, ...
   - Other files → `[File #1]`, `[File #2]`, ...
 - On prompt submit:
   - `[Image #n]` becomes real image attachment for model input
   - `[File #n]` resolves to cached stable temp path
-- Session cache is cleaned automatically on session shutdown
+- Marker resolution is resilient across task/session transitions in the same gsd run
+- Re-dragging from reused temp paths re-caches the newest file snapshot
 
 ---
 
-## Requirements
-
-- `gsd` installed and available in PATH
-- Node.js available in PATH
-- A running `gsd` terminal session for `/reload`
-
-> No manual `.env` setup is required for this extension's core behavior.
-
----
-
-## Installation (Step by Step)
-
-### 1) Clone or open the project directory
+## Installation
 
 ```bash
 cd /path/to/gsd-utility-extension
-```
-
-### 2) Run installer
-
-```bash
 ./install.sh
 ```
 
-What installer does:
-
-- Validates extension syntax (`node --check`)
-- Removes old split packages if they exist (portable cleanup, no user-specific absolute paths)
-- Performs clean local reinstall
-- Verifies install via `gsd list`
-
-### Portability note
-
-This repository is designed to be **user/machine agnostic**:
-
-- No hardcoded usernames like `/Users/<name>/...`
-- No hardcoded project location assumptions
-- Installer resolves paths dynamically from its own location
-- Session cache uses OS temp directory (`os.tmpdir()`)
-
-### 3) Reload active session
-
-In your active `gsd` terminal:
+Then in active `gsd` terminal:
 
 ```bash
 /reload
 ```
 
-If you do not have an active session, restart `gsd`.
-
 ---
 
-## Usage (Step by Step)
+## Usage
 
-## A) Stop with double Escape
+## A) Stop with Esc
 
-1. In active session, press `Esc Esc`
+1. In active session, press `Esc`
 2. Extension sends `/gsd stop`
+3. If your terminal intercepts `Esc`, use `F4` fallback
 
 ## B) Check usage footer
 
@@ -148,7 +95,7 @@ If you do not have an active session, restart `gsd`.
 1. Drag screenshot file into terminal input
 2. Marker appears (for example `[Image #1]`)
 3. Type your question and send
-4. Image is attached from stable session cache
+4. Image is attached from stable cache
 
 ## E) Inspect cached mappings
 
@@ -156,15 +103,14 @@ If you do not have an active session, restart `gsd`.
 /dragcache
 ```
 
-This pastes marker → cached path mappings into the editor.
-
 ---
 
 ## Commands and Shortcuts
 
 | Action | Command / Key |
 |---|---|
-| Stop auto quickly | `Esc Esc` |
+| Stop auto quickly | `Esc` (`F4` fallback) |
+| Force stop command | `/panicstop` |
 | Switch OpenAI account | `/swap <id>` |
 | Open quick account picker | `F2` |
 | Show drag cache mappings | `/dragcache` |
@@ -173,41 +119,14 @@ This pastes marker → cached path mappings into the editor.
 
 ## Troubleshooting
 
-## Extension behavior not updated
-
-- Run `/reload` in active session
-- If needed, restart `gsd`
-
-## Double Esc does not trigger
+## Esc does not trigger
 
 - Check terminal keybinding conflicts
 - Ensure extension is installed (`gsd list`)
+- Use `F4` fallback
 
 ## Dropped file remains raw path
 
 - Run `/reload` after install
 - Retry drag-and-drop once
 - Use `/dragcache` to verify cached entries
-
----
-
-## Project Structure
-
-```text
-gsd-utility-extension/
-├── extensions/
-│   └── utility-extension.js
-├── install.sh
-├── package.json
-└── README.md
-```
-
----
-
-## Local Install Verification
-
-```bash
-gsd list
-```
-
-You should see this project path in installed project packages.

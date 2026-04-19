@@ -13,12 +13,16 @@ const OPENAI_CODEX_PROVIDER = "openai-codex";
 const OPENAI_MULTI_ACCOUNTS_KEY = "__openaiMultiAccounts";
 const OPENAI_ACTIVE_ACCOUNT_ID_KEY = "__openaiActiveAccountId";
 const OPENAI_SWAP_STATUS_KEY = "openai-swap";
+const STOP_STATUS_KEY = "force-stop";
 
 const DRAG_CACHE_STATUS_KEY = "drag-cache";
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
 const DRAG_CACHE_ROOT = path.join(os.tmpdir(), "gsd-drag-cache");
 const DROP_CAPTURE_STALE_MS = 2000;
+const MAX_DRAG_CACHES = 8;
+const LEGACY_F4_SEQUENCES = new Set(["\x1bOS", "\x1b[14~", "\x1b[[D"]);
+const STOP_SHORTCUT_KEY = Key.escape || Key.esc;
 
 const IMAGE_MIME_BY_EXT = new Map([
   [".png", "image/png"],
@@ -35,6 +39,22 @@ const IMAGE_MIME_BY_EXT = new Map([
 
 function sanitizeStatusText(text) {
   return String(text).replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
+}
+
+function isF4Input(data) {
+  if (typeof data !== "string" || data.length === 0) return false;
+  if (matchesKey(data, Key.f4)) return true;
+  return LEGACY_F4_SEQUENCES.has(data);
+}
+
+function isEscapeInput(data) {
+  if (typeof data !== "string" || data.length === 0) return false;
+  if (matchesKey(data, Key.escape) || matchesKey(data, Key.esc)) return true;
+  return data === "\x1b";
+}
+
+function isForceStopInput(data) {
+  return isEscapeInput(data) || isF4Input(data);
 }
 
 function formatTokens(count) {
@@ -267,9 +287,47 @@ function ensureSessionDragCache(state, ctx) {
   if (!state.dragCacheBySessionId.has(sessionId)) {
     const cache = createSessionDragCache(sessionId);
     state.dragCacheBySessionId.set(sessionId, cache);
+    pruneOldDragCaches(state, sessionId);
   }
 
   return state.dragCacheBySessionId.get(sessionId);
+}
+
+function pruneOldDragCaches(state, keepSessionId) {
+  if (state.dragCacheBySessionId.size <= MAX_DRAG_CACHES) return;
+
+  for (const [sessionId, cache] of state.dragCacheBySessionId.entries()) {
+    if (state.dragCacheBySessionId.size <= MAX_DRAG_CACHES) break;
+    if (sessionId === keepSessionId) continue;
+
+    try {
+      fs.rmSync(cache.dir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+
+    state.dragCacheBySessionId.delete(sessionId);
+  }
+}
+
+function getDragCachesInResolutionOrder(state, ctx) {
+  const ordered = [];
+  const active = ensureSessionDragCache(state, ctx);
+  if (active) ordered.push(active);
+
+  for (const cache of state.dragCacheBySessionId.values()) {
+    if (cache !== active) ordered.push(cache);
+  }
+
+  return ordered;
+}
+
+function findDragEntryByMarker(state, ctx, marker) {
+  for (const cache of getDragCachesInResolutionOrder(state, ctx)) {
+    const entry = cache.entriesByMarker.get(marker);
+    if (entry) return { cache, entry };
+  }
+  return null;
 }
 
 function copyDroppedPathToSessionCache(state, ctx, rawToken) {
@@ -290,7 +348,15 @@ function copyDroppedPathToSessionCache(state, ctx, rawToken) {
   if (!cache) return null;
 
   const existing = cache.entriesBySourcePath.get(absolutePath);
-  if (existing) return existing;
+  if (existing) {
+    const sameFileSnapshot =
+      Number(existing.sourceSize) === Number(stat.size)
+      && Number(existing.sourceMtimeMs) === Number(stat.mtimeMs)
+      && typeof existing.cachedPath === "string"
+      && fs.existsSync(existing.cachedPath);
+
+    if (sameFileSnapshot) return existing;
+  }
 
   const mimeType = toImageMimeType(absolutePath);
   const kind = mimeType ? "image" : "file";
@@ -314,6 +380,8 @@ function copyDroppedPathToSessionCache(state, ctx, rawToken) {
     kind,
     mimeType,
     sourcePath: absolutePath,
+    sourceSize: Number(stat.size) || 0,
+    sourceMtimeMs: Number(stat.mtimeMs) || 0,
     cachedPath,
   };
 
@@ -353,105 +421,53 @@ function transformDroppedPasteText(state, ctx, pastedText) {
 function transformTerminalInputForDropCache(state, ctx, data) {
   if (typeof data !== "string" || data.length === 0) return undefined;
 
-  const initiallyActive = !!state.dropPasteCapture.active;
-  let output = "";
-  let index = 0;
-  const allMarkers = [];
-  let transformedCount = 0;
+  // Bracketed paste marker'larını normalize et; bazı terminaller bu kontrol kodlarını
+  // parça parça gönderdiğinde önceki state machine marker dönüşümünü kaçırabiliyordu.
+  const normalized = String(data)
+    .split(BRACKETED_PASTE_START).join("")
+    .split(BRACKETED_PASTE_END).join("");
 
-  while (index < data.length) {
-    if (!state.dropPasteCapture.active) {
-      const startIdx = data.indexOf(BRACKETED_PASTE_START, index);
-      if (startIdx === -1) {
-        output += data.slice(index);
-        break;
-      }
-
-      output += data.slice(index, startIdx);
-      state.dropPasteCapture.active = true;
-      state.dropPasteCapture.buffer = "";
-      state.dropPasteCapture.startedAt = Date.now();
-      index = startIdx + BRACKETED_PASTE_START.length;
-      continue;
+  const result = transformDroppedPasteText(state, ctx, normalized);
+  if (result.transformedCount > 0) {
+    if (ctx?.hasUI) {
+      const preview = result.markers.slice(0, 3).join(" ");
+      const suffix = result.markers.length > 3 ? " …" : "";
+      ctx.ui.notify(`Drag cache: ${result.markers.length} dosya yakalandı ${preview}${suffix}`, "info");
+      ctx.ui.setStatus(DRAG_CACHE_STATUS_KEY, `Drag cache active · ${result.markers.length} marker`);
     }
-
-    const endIdx = data.indexOf(BRACKETED_PASTE_END, index);
-    if (endIdx === -1) {
-      const chunk = data.slice(index);
-
-      // Paste capture modundayken farklı bir escape geldi ise (örn Esc), yakalamayı bırak.
-      if (chunk.includes("\x1b")) {
-        output += state.dropPasteCapture.buffer + chunk;
-        state.dropPasteCapture.active = false;
-        state.dropPasteCapture.buffer = "";
-        state.dropPasteCapture.startedAt = 0;
-        index = data.length;
-        break;
-      }
-
-      state.dropPasteCapture.buffer += chunk;
-
-      const age = Date.now() - Number(state.dropPasteCapture.startedAt || Date.now());
-      if (age > DROP_CAPTURE_STALE_MS) {
-        // Bracketed paste kapanış marker'ı hiç gelmediyse input'u kilitleme.
-        output += state.dropPasteCapture.buffer;
-        state.dropPasteCapture.active = false;
-        state.dropPasteCapture.buffer = "";
-        state.dropPasteCapture.startedAt = 0;
-      }
-
-      index = data.length;
-      break;
-    }
-
-    state.dropPasteCapture.buffer += data.slice(index, endIdx);
-    const result = transformDroppedPasteText(state, ctx, state.dropPasteCapture.buffer);
-
-    output += `${BRACKETED_PASTE_START}${result.transformed}${BRACKETED_PASTE_END}`;
-    transformedCount += result.transformedCount;
-    allMarkers.push(...result.markers);
-
-    state.dropPasteCapture.active = false;
-    state.dropPasteCapture.buffer = "";
-    state.dropPasteCapture.startedAt = 0;
-    index = endIdx + BRACKETED_PASTE_END.length;
+    return { data: result.transformed };
   }
 
-  // Bazı terminallerde bracketed paste kapalı olabilir; tek-chunk path paste için fallback.
-  if (transformedCount === 0 && !state.dropPasteCapture.active && !data.includes("\x1b")) {
-    const fallback = transformDroppedPasteText(state, ctx, data);
-    if (fallback.transformedCount > 0) {
-      output = fallback.transformed;
-      transformedCount = fallback.transformedCount;
-      allMarkers.push(...fallback.markers);
-    }
+  if (normalized !== data) {
+    return { data: normalized };
   }
 
-  if (transformedCount > 0 && ctx?.hasUI) {
-    const preview = allMarkers.slice(0, 3).join(" ");
-    const suffix = allMarkers.length > 3 ? " …" : "";
-    ctx.ui.notify(`Drag cache: ${allMarkers.length} dosya yakalandı ${preview}${suffix}`, "info");
-    ctx.ui.setStatus(DRAG_CACHE_STATUS_KEY, `Drag cache active · ${allMarkers.length} marker`);
-  }
-
-  const changed = output !== data;
-  if (!changed && !initiallyActive && !state.dropPasteCapture.active) {
-    return undefined;
-  }
-
-  return { data: output };
+  return undefined;
 }
 
 function materializeDragMarkersInPrompt(state, ctx, text, images) {
-  const cache = ensureSessionDragCache(state, ctx);
-  if (!cache) return { changed: false, text, images };
+  const activeCache = ensureSessionDragCache(state, ctx);
+  if (!activeCache) return { changed: false, text, images };
 
   let nextText = String(text || "");
   const nextImages = Array.isArray(images) ? [...images] : [];
   let changed = false;
 
-  for (const [marker, entry] of cache.entriesByMarker.entries()) {
-    if (!nextText.includes(marker)) continue;
+  const markersInPrompt = Array.from(new Set(nextText.match(/\[(?:Image|File) #\d+\]/g) || []));
+
+  for (const marker of markersInPrompt) {
+    const located = findDragEntryByMarker(state, ctx, marker);
+    if (!located) continue;
+
+    const { cache, entry } = located;
+
+    // Marker farklı bir session cache'inde kaldıysa aktif cache'e de bağla.
+    if (cache !== activeCache) {
+      activeCache.entriesByMarker.set(marker, entry);
+      if (entry.sourcePath) {
+        activeCache.entriesBySourcePath.set(entry.sourcePath, entry);
+      }
+    }
 
     if (entry.kind === "image") {
       try {
@@ -463,7 +479,25 @@ function materializeDragMarkersInPrompt(state, ctx, text, images) {
         });
         changed = true;
       } catch {
-        // If image materialization fails, keep marker text unchanged.
+        // Cached kopya silinmişse source path'ten tekrar materialize etmeyi dene.
+        try {
+          if (entry.sourcePath && fs.existsSync(entry.sourcePath)) {
+            const fallbackName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${sanitizeFileName(path.basename(entry.sourcePath))}`;
+            const fallbackPath = path.join(activeCache.dir, fallbackName);
+            fs.copyFileSync(entry.sourcePath, fallbackPath);
+            entry.cachedPath = fallbackPath;
+
+            const data = fs.readFileSync(entry.cachedPath).toString("base64");
+            nextImages.push({
+              type: "image",
+              data,
+              mimeType: entry.mimeType || "image/png",
+            });
+            changed = true;
+          }
+        } catch {
+          // If image materialization fails, keep marker text unchanged.
+        }
       }
       continue;
     }
@@ -810,6 +844,42 @@ export default function registerExtension(pi) {
     if (typeof state.requestRender === "function") state.requestRender();
   };
 
+  const requestImmediateStop = (ctx, sourceLabel = "shortcut") => {
+    const tryAbort = () => {
+      try {
+        ctx?.abort?.();
+      } catch {
+        // ignore abort errors; stop command still sent below
+      }
+    };
+
+    // İlk kesme denemesi + kısa aralıklı tekrarlar (tool call kilitlenmelerine karşı)
+    tryAbort();
+    let retries = 0;
+    const retryTimer = setInterval(() => {
+      retries += 1;
+      const idle = !!ctx?.isIdle?.();
+      if (idle || retries >= 6) {
+        clearInterval(retryTimer);
+        return;
+      }
+      tryAbort();
+    }, 80);
+
+    if (ctx?.hasUI) {
+      ctx.ui.notify(`${sourceLabel}: aktif görev iptal ediliyor, /gsd stop gönderiliyor`, "warning");
+      ctx.ui.setStatus(STOP_STATUS_KEY, `${sourceLabel}: force-stop requested`);
+    }
+
+    // Abort çağrısı modeli keser; /gsd stop auto döngüyü kapatır.
+    pi.sendUserMessage("/gsd stop", { deliverAs: "steer" });
+
+    // Streaming state değişim yarışlarında komutu tekrar enjekte et.
+    setTimeout(() => {
+      pi.sendUserMessage("/gsd stop", { deliverAs: "steer" });
+    }, 120);
+  };
+
   const clearSwapPickerStatus = () => {
     if (state.ctx?.hasUI) state.ctx.ui.setStatus(OPENAI_SWAP_STATUS_KEY, undefined);
   };
@@ -993,10 +1063,18 @@ export default function registerExtension(pi) {
     }
 
     state.terminalInputUnsub = ctx.ui.onTerminalInput((data) => {
-      const swapResult = handleSwapTerminalInput(data, ctx);
+      const liveCtx = state.ctx || ctx;
+
+      const swapResult = handleSwapTerminalInput(data, liveCtx);
       if (swapResult?.consume) return swapResult;
 
-      return transformTerminalInputForDropCache(state, ctx, data);
+      if (isForceStopInput(data)) {
+        const sourceLabel = isEscapeInput(data) ? "Esc" : "F4";
+        requestImmediateStop(liveCtx, sourceLabel);
+        return { consume: true };
+      }
+
+      return transformTerminalInputForDropCache(state, liveCtx, data);
     });
   };
 
@@ -1228,14 +1306,26 @@ export default function registerExtension(pi) {
     state.openaiCodexProviderInstalled = true;
   };
 
-  // Double-Escape normally arrives as ctrl+alt+[ in terminal key parsing.
-  pi.registerShortcut(Key.ctrlAlt("["), {
-    description: "Stop auto mode (double Esc)",
+  pi.registerShortcut(STOP_SHORTCUT_KEY, {
+    description: "Stop current task immediately + /gsd stop",
     handler: async (ctx) => {
-      if (ctx?.hasUI) {
-        ctx.ui.notify("Double Esc detected: sending /gsd stop", "info");
-      }
-      pi.sendUserMessage("/gsd stop", { deliverAs: "steer" });
+      requestImmediateStop(ctx, "Esc");
+    },
+  });
+
+  // F4 mevcut alışkanlıklar için fallback olarak bırakıldı.
+  pi.registerShortcut(Key.f4, {
+    description: "Fallback immediate stop (legacy F4)",
+    handler: async (ctx) => {
+      requestImmediateStop(ctx, "F4");
+    },
+  });
+
+  // Bazı terminallerde/OS seviyesinde yakalanırsa, legacy kombinasyon fallback olarak dursun.
+  pi.registerShortcut(Key.ctrlAlt("["), {
+    description: "Fallback immediate stop (legacy double-Esc)",
+    handler: async (ctx) => {
+      requestImmediateStop(ctx, "Legacy stop");
     },
   });
 
@@ -1320,6 +1410,13 @@ export default function registerExtension(pi) {
       renderNow();
     }
   };
+
+  pi.registerCommand("panicstop", {
+    description: "Aktif görevi anında kes + /gsd stop",
+    handler: async (_args, ctx) => {
+      requestImmediateStop(ctx, "/panicstop");
+    },
+  });
 
   pi.registerCommand("swap", {
     description: "OpenAI hesap değiştir: /swap <id>",
@@ -1544,9 +1641,17 @@ export default function registerExtension(pi) {
   });
 
   pi.on("turn_start", (_event, ctx) => {
+    state.ctx = ctx;
+    state.currentModel = ctx.model;
+
     if (!state.footerInstalled) {
       installFooter(ctx);
     }
+
+    // Bazı çalışma akışlarında terminal input subscription'ı task sonrası düşebiliyor.
+    // Her turn başında yeniden doğrulayıp drop-cache'in canlı kalmasını sağla.
+    installTerminalInputHandler(ctx);
+
     ensureSessionDragCache(state, ctx);
     syncOpenAIAccountsFromAuth(ctx);
   });
@@ -1561,12 +1666,16 @@ export default function registerExtension(pi) {
 
   pi.on("message_end", (_event, ctx) => {
     state.ctx = ctx;
+    installTerminalInputHandler(ctx);
+    ctx?.ui?.setStatus?.(STOP_STATUS_KEY, undefined);
     syncOpenAIAccountsFromAuth(ctx);
     renderNow();
   });
 
   pi.on("turn_end", (_event, ctx) => {
     state.ctx = ctx;
+    installTerminalInputHandler(ctx);
+    ctx?.ui?.setStatus?.(STOP_STATUS_KEY, undefined);
     syncOpenAIAccountsFromAuth(ctx);
     renderNow();
   });
@@ -1574,12 +1683,25 @@ export default function registerExtension(pi) {
   pi.on("session_shutdown", (_event, ctx) => {
     clearTimer();
     closeSwapPicker();
+
     if (typeof state.terminalInputUnsub === "function") {
-      state.terminalInputUnsub();
+      try {
+        state.terminalInputUnsub();
+      } catch {
+        // ignore unsubscribe edge cases
+      }
       state.terminalInputUnsub = null;
     }
-    clearAllDragCaches(state);
+
+    // Task sınırlarında session lifecycle resetlenebildiği için drag-cache'i burada silmiyoruz.
+    // Böylece marker -> dosya çözümü aynı gsd çalışması boyunca stabil kalıyor.
     ctx?.ui?.setStatus?.(DRAG_CACHE_STATUS_KEY, undefined);
+    ctx?.ui?.setStatus?.(STOP_STATUS_KEY, undefined);
     state.footerInstalled = false;
   });
+
+  process.once("exit", () => {
+    clearAllDragCaches(state);
+  });
 }
+

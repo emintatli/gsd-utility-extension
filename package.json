@@ -2,7 +2,7 @@
   "name": "gsd-utility-extension",
   "version": "1.0.0",
   "private": true,
-  "description": "Utility extension: double-Esc auto-stop + OpenAI/Codex WHAM usage footer.",
+  "description": "Utility extension: Esc auto-stop (+F4 fallback) + OpenAI/Codex WHAM usage footer.",
   "keywords": ["pi-package", "gsd", "utility", "openai", "codex", "shortcut"],
   "pi": {
     "extensions": ["./extensions/utility-extension.js"]
