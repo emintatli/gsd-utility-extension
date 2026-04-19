@@ -30,3 +30,13 @@
 {"id":"fedb62ce-d305-41d3-b01b-3ec77d68fa7a","ts":"2026-04-19T17:11:26.816Z","severity":"info","message":"OpenAI hesap değişti: #1 (emintatli06)","source":"notify","read":false}
 {"id":"ab698e28-fefc-4373-b3ef-38f641bcda4b","ts":"2026-04-19T17:11:42.965Z","severity":"info","message":"Drag cache(terminal-input): 1 dosya [Image#1]","source":"notify","read":false}
 {"id":"d4d94d32-b8c9-46fe-83fe-e8d7ac331322","ts":"2026-04-19T17:11:50.944Z","severity":"info","message":"Drag cache(terminal-input): 1 dosya [Image#2]","source":"notify","read":false}
+{"id":"dedf7eeb-ecdc-4b28-9588-40244225af4d","ts":"2026-04-19T17:20:30.397Z","severity":"info","message":"Drag cache(terminal-input): 1 dosya [Image#1]","source":"notify","read":false}
+{"id":"0cb4e4a5-f884-4cd1-b75e-888130b56aeb","ts":"2026-04-19T17:20:56.741Z","severity":"info","message":"Drag cache(terminal-input): 1 dosya [Image#2]","source":"notify","read":false}
+{"id":"4d33a618-120a-466a-a822-c44715ceb05d","ts":"2026-04-19T17:56:48.399Z","severity":"warning","message":"Context7: No CONTEXT7_API_KEY set. Using free tier (1000 req/month limit). Set CONTEXT7_API_KEY for higher limits.","source":"notify","read":false}
+{"id":"77ec5de0-929f-4d37-b4c0-0317dbb7dd09","ts":"2026-04-19T17:56:48.400Z","severity":"warning","message":"Google Search: No authentication set. Log in via Google or set GEMINI_API_KEY to use google_search.","source":"notify","read":false}
+{"id":"e90b9c6d-9059-411c-a342-3f1066f19a2c","ts":"2026-04-19T17:57:11.496Z","severity":"warning","message":"Context7: No CONTEXT7_API_KEY set. Using free tier (1000 req/month limit). Set CONTEXT7_API_KEY for higher limits.","source":"notify","read":false}
+{"id":"ff93a68b-a23b-4190-96a0-137ce10fd249","ts":"2026-04-19T17:57:11.496Z","severity":"warning","message":"Google Search: No authentication set. Log in via Google or set GEMINI_API_KEY to use google_search.","source":"notify","read":false}
+{"id":"dbf30c38-e2e5-4da0-bca0-c3e92eda4148","ts":"2026-04-19T18:08:20.927Z","severity":"info","message":"Inline payload deferred [Image#1]","source":"notify","read":false}
+{"id":"91028c28-5784-4f8c-a215-272a91127bb9","ts":"2026-04-19T18:14:31.228Z","severity":"info","message":"Drag cache(terminal-input): 1 dosya [Image#1]","source":"notify","read":false}
+{"id":"c6d3d998-6244-4018-b444-abcfbea4b5cf","ts":"2026-04-19T18:14:58.419Z","severity":"info","message":"Drag cache(terminal-input): 1 dosya [Image#2]","source":"notify","read":false}
+{"id":"5840bb55-3833-4206-bfbb-01de1f27a28b","ts":"2026-04-19T18:15:02.202Z","severity":"info","message":"Drag cache(terminal-input): 1 dosya [Image#3]","source":"notify","read":false}

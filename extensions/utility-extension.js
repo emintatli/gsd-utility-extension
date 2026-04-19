@@ -28,11 +28,19 @@ const STOP_STEER_RETRY_DELAY_MS = 120;
 const DROP_PATH_RETRY_ATTEMPTS = 6;
 const DROP_PATH_RETRY_ATTEMPTS_EPHEMERAL = 120;
 const DROP_PATH_RETRY_DELAY_MS = 25;
+const INLINE_PAYLOAD_CAPTURE_STALE_MS = 6000;
+const INLINE_PAYLOAD_CAPTURE_MAX_CHARS = 4_000_000;
 const DRAFT_RECONCILE_INTERVAL_MS = 250;
 const DRAFT_RECONCILE_MIN_GAP_MS = 300;
 
+// Clipboard image (Cmd/Ctrl+V) handling intentionally disabled.
+// User requested to keep path/drag marker flow, but remove clipboard-image flow entirely.
+const ENABLE_CLIPBOARD_IMAGE_FLOW = false;
+
 const MARKER_PATTERN = /\[(?:Image|File) ?#\d+\]|\[Image-(?:ClipBoard|Clipboard)#\d+\]/g;
-const PASTED_TOKEN_PATTERN = /'[^']+'|"[^"]+"|‘[^’]+’|“[^”]+”|['"“”‘’]?(?:~|\/|\.\.?\/)(?:\\.|[^\s'"“”‘’])+['"“”‘’]?/g;
+// Path token eşleşmesini whitespace/start boundary ile sınırla.
+// Böylece base64 içindeki "/" parçaları yanlışlıkla dosya yolu sanılmaz.
+const PASTED_TOKEN_PATTERN = /(^|[\s\r\n])('(?:[^'\\]|\\.)+'|"(?:[^"\\]|\\.)+"|‘[^’]+’|“[^”]+”|['"“”‘’]?(?:~|\/|\.\.?\/)(?:\\.|[^\s'"“”‘’])+['"“”‘’]?)/g;
 
 const IMAGE_MIME_BY_EXT = new Map([
   [".png", "image/png"],
@@ -45,6 +53,17 @@ const IMAGE_MIME_BY_EXT = new Map([
   [".tiff", "image/tiff"],
   [".heic", "image/heic"],
   [".heif", "image/heif"],
+]);
+
+const IMAGE_EXT_BY_MIME = new Map([
+  ["image/png", "png"],
+  ["image/jpeg", "jpg"],
+  ["image/gif", "gif"],
+  ["image/webp", "webp"],
+  ["image/bmp", "bmp"],
+  ["image/tiff", "tiff"],
+  ["image/heic", "heic"],
+  ["image/heif", "heif"],
 ]);
 
 function sanitizeStatusText(text) {
@@ -226,6 +245,334 @@ function resolveUserAgent() {
 function toImageMimeType(filePath) {
   const ext = path.extname(String(filePath || "")).toLowerCase();
   return IMAGE_MIME_BY_EXT.get(ext) || "";
+}
+
+function normalizeImageMimeType(rawMimeType) {
+  const mimeType = String(rawMimeType || "").trim().toLowerCase();
+  return mimeType.startsWith("image/") ? mimeType : "";
+}
+
+function toImageExtFromMimeType(rawMimeType) {
+  const mimeType = normalizeImageMimeType(rawMimeType);
+  return IMAGE_EXT_BY_MIME.get(mimeType) || "";
+}
+
+function sniffImageMimeTypeFromBuffer(buffer) {
+  if (!buffer || buffer.length < 4) return "";
+
+  // PNG
+  if (
+    buffer.length >= 8
+    && buffer[0] === 0x89
+    && buffer[1] === 0x50
+    && buffer[2] === 0x4e
+    && buffer[3] === 0x47
+    && buffer[4] === 0x0d
+    && buffer[5] === 0x0a
+    && buffer[6] === 0x1a
+    && buffer[7] === 0x0a
+  ) return "image/png";
+
+  // JPEG
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "image/jpeg";
+
+  // GIF
+  if (
+    buffer.length >= 6
+    && buffer[0] === 0x47
+    && buffer[1] === 0x49
+    && buffer[2] === 0x46
+    && buffer[3] === 0x38
+  ) return "image/gif";
+
+  // WEBP (RIFF....WEBP)
+  if (
+    buffer.length >= 12
+    && buffer[0] === 0x52
+    && buffer[1] === 0x49
+    && buffer[2] === 0x46
+    && buffer[3] === 0x46
+    && buffer[8] === 0x57
+    && buffer[9] === 0x45
+    && buffer[10] === 0x42
+    && buffer[11] === 0x50
+  ) return "image/webp";
+
+  // BMP
+  if (buffer[0] === 0x42 && buffer[1] === 0x4d) return "image/bmp";
+
+  // TIFF
+  if (
+    (buffer[0] === 0x49 && buffer[1] === 0x49 && buffer[2] === 0x2a && buffer[3] === 0x00)
+    || (buffer[0] === 0x4d && buffer[1] === 0x4d && buffer[2] === 0x00 && buffer[3] === 0x2a)
+  ) return "image/tiff";
+
+  // HEIC/HEIF: ....ftypheic/heif
+  if (
+    buffer.length >= 12
+    && buffer[4] === 0x66
+    && buffer[5] === 0x74
+    && buffer[6] === 0x79
+    && buffer[7] === 0x70
+  ) {
+    const brand = buffer.toString("ascii", 8, 12).toLowerCase();
+    if (brand.startsWith("hei")) return "image/heic";
+    if (brand.startsWith("mif") || brand.startsWith("heif")) return "image/heif";
+  }
+
+  return "";
+}
+
+function decodeBase64ImagePayload(rawBase64, mimeHint = "") {
+  const normalized = String(rawBase64 || "").replace(/\s+/g, "");
+  if (!normalized || normalized.length < 128) return null;
+  if (!/^[A-Za-z0-9+/=_-]+$/.test(normalized)) return null;
+
+  let buffer;
+  try {
+    buffer = Buffer.from(normalized, "base64");
+  } catch {
+    return null;
+  }
+
+  if (!buffer || buffer.length === 0) return null;
+
+  const sniffedMimeType = sniffImageMimeTypeFromBuffer(buffer);
+  const safeMimeHint = normalizeImageMimeType(mimeHint);
+  const mimeType = safeMimeHint || sniffedMimeType;
+  if (!mimeType) return null;
+
+  const ext = toImageExtFromMimeType(mimeType) || "png";
+  return { buffer, mimeType, ext };
+}
+
+function decodeInlineImageDataCandidate(rawValue, rawMimeHint) {
+  const mimeHint = normalizeImageMimeType(rawMimeHint);
+
+  if (rawValue && typeof rawValue === "object" && rawValue.type === "Buffer" && Array.isArray(rawValue.data)) {
+    try {
+      const buffer = Buffer.from(rawValue.data);
+      if (buffer.length > 0) {
+        const sniffed = sniffImageMimeTypeFromBuffer(buffer);
+        const mimeType = mimeHint || sniffed;
+        if (!mimeType) return null;
+        const ext = toImageExtFromMimeType(mimeType) || "png";
+        return { buffer, mimeType, ext };
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  if (typeof rawValue !== "string") return null;
+
+  const value = rawValue.trim();
+  if (!value) return null;
+
+  const dataUrlMatch = value.match(/^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=_-]+)$/i);
+  if (dataUrlMatch) {
+    const decoded = decodeBase64ImagePayload(dataUrlMatch[2], dataUrlMatch[1] || mimeHint);
+    if (!decoded) return null;
+    return decoded;
+  }
+
+  return decodeBase64ImagePayload(value, mimeHint);
+}
+
+function normalizeMaybeEscapedJsonText(raw) {
+  const text = String(raw || "");
+  if (!text) return "";
+
+  let normalized = text;
+
+  // "{\"ok\":true,...}" gibi çift-escape edilmiş JSON payload'larını normalize et.
+  if (/\\"(?:ok|b64|base64|mime(?:Type)?|data)\\"/i.test(normalized)) {
+    normalized = normalized
+      .replace(/\\"/g, '"')
+      .replace(/\\\//g, "/")
+      .replace(/\\n/g, "")
+      .replace(/\\r/g, "");
+  }
+
+  return normalized;
+}
+
+function extractImagePayloadFromJsonLikeText(text) {
+  const normalized = normalizeMaybeEscapedJsonText(text);
+
+  const dataUrlMatch = normalized.match(/data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=_-]{128,})/i);
+  if (dataUrlMatch) {
+    return decodeBase64ImagePayload(dataUrlMatch[2], dataUrlMatch[1]);
+  }
+
+  const mimeMatch = normalized.match(/"(?:mime(?:Type)?|contentType)"\s*:\s*"([^"]+)"/i);
+  const mimeHint = normalizeImageMimeType(mimeMatch?.[1] || "");
+
+  const b64FieldRegex = /"(?:b64|base64|data|imageData|payload)"\s*:\s*"([^"]{128,})"/ig;
+  let match;
+  while ((match = b64FieldRegex.exec(normalized)) != null) {
+    const candidate = String(match[1] || "")
+      .replace(/\\\//g, "/")
+      .replace(/\\n/g, "")
+      .replace(/\\r/g, "")
+      .trim();
+
+    const decoded = decodeBase64ImagePayload(candidate, mimeHint);
+    if (decoded) return decoded;
+  }
+
+  return null;
+}
+
+function extractInlineImagePayloadFromText(text) {
+  const raw = String(text || "");
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  const normalized = normalizeMaybeEscapedJsonText(trimmed);
+
+  // JSON parse olmasa da alan bazlı regex fallback ile payload yakalamaya çalış.
+  const byJsonLikeFields = extractImagePayloadFromJsonLikeText(normalized);
+  if (byJsonLikeFields) return byJsonLikeFields;
+
+  if (!(normalized.startsWith("{") || normalized.startsWith("["))) return null;
+  if (!/("type"|"mimeType"|"mime"|"data"|"b64"|"base64")/i.test(normalized)) return null;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(normalized);
+  } catch {
+    return null;
+  }
+
+  // JSON string içinde tekrar JSON gömülmüşse ikinci parse dene.
+  if (typeof parsed === "string") {
+    const nested = extractInlineImagePayloadFromText(parsed);
+    if (nested) return nested;
+    return decodeInlineImageDataCandidate(parsed, "");
+  }
+
+  const queue = [parsed];
+  let visited = 0;
+
+  while (queue.length > 0 && visited < 400) {
+    const node = queue.shift();
+    visited += 1;
+
+    if (!node || typeof node !== "object") continue;
+
+    if (Array.isArray(node)) {
+      for (const item of node) queue.push(item);
+      continue;
+    }
+
+    const typeHint = String(node.type || node.kind || "").toLowerCase();
+    const mimeHint = normalizeImageMimeType(node.mimeType || node.mime || node.contentType || "");
+    const isImageHint = typeHint.includes("image") || !!mimeHint;
+
+    const dataCandidates = [node.data, node.b64, node.base64, node.imageData, node.payload];
+    for (const candidate of dataCandidates) {
+      const decoded = decodeInlineImageDataCandidate(candidate, mimeHint);
+      if (!decoded) continue;
+
+      const candidateString = typeof candidate === "string" ? candidate.trim() : "";
+      const candidateIsDataUrl = /^data:image\//i.test(candidateString);
+      if (!isImageHint && !candidateIsDataUrl) continue;
+
+      return decoded;
+    }
+
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") queue.push(value);
+    }
+  }
+
+  return null;
+}
+
+function extractRawBase64ImagePayloadFromText(text) {
+  const raw = String(text || "");
+  let trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  // Tek parça quote ile sarılmış base64 payload'larda quote'ları kaldır.
+  if (
+    (trimmed.startsWith("\"") && trimmed.endsWith("\""))
+    || (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    trimmed = trimmed.slice(1, -1).trim();
+  }
+
+  if (!trimmed) return null;
+  return decodeBase64ImagePayload(trimmed, "");
+}
+
+function containsLikelyInlineImagePayload(text) {
+  if (!ENABLE_CLIPBOARD_IMAGE_FLOW) return false;
+
+  const value = String(text || "");
+  if (!value) return false;
+
+  if (/data:image\/[a-z0-9.+-]+;base64,/i.test(value)) return true;
+  if (/("type"\s*:\s*"image|"mime(?:Type)?"\s*:\s*"image\/|"(?:data|b64|base64)"\s*:)/i.test(value)) return true;
+  if (/(\\"type\\"\s*:\s*\\"image|\\"mime(?:Type)?\\"\s*:\s*\\"image\/|\\"(?:data|b64|base64)\\"\s*:)/i.test(value)) return true;
+  if (/[A-Za-z0-9+/=_-]{1024,}/.test(value)) return true;
+
+  return false;
+}
+
+function looksLikeInlinePayloadCaptureStart(text) {
+  if (!ENABLE_CLIPBOARD_IMAGE_FLOW) return false;
+
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return false;
+
+  // Tam payload veya escaped payload başlangıcı
+  if (/^\{\s*"ok"\s*:\s*true\b/i.test(trimmed)) return true;
+  if (/^\{\s*\\"ok\\"\s*:\s*true\b/i.test(trimmed)) return true;
+  if (/^"\{\\"ok\\"\s*:\s*true/i.test(trimmed)) return true;
+
+  if (trimmed === "{" || trimmed === "[" || trimmed === "{\"" || trimmed === "{\\\"") return true;
+
+  // Chunk'lı paste başlangıcı: JSON objesi henüz tamamlanmamış olabilir.
+  if (/^\{/.test(trimmed) || /^\{\\"/.test(trimmed)) {
+    if (/("ok"|\\"ok\\"|"ext"|\\"ext\\"|"mime(?:Type)?"|\\"mime(?:Type)?\\"|"(?:b64|base64|data)"|\\"(?:b64|base64|data)\\")/i.test(trimmed)) {
+      return true;
+    }
+  }
+
+  // Ham base64 paste (JSON sarmalı yok)
+  if (/^[A-Za-z0-9+/=_-]{256,}$/.test(trimmed)) return true;
+
+  return false;
+}
+
+function resetInlinePayloadCapture(state) {
+  state.inlinePayloadCapture.active = false;
+  state.inlinePayloadCapture.buffer = "";
+  state.inlinePayloadCapture.startedAt = 0;
+  state.inlinePayloadCapture.drainUntil = 0;
+}
+
+function tryResolveInlinePayloadCapture(state, ctx, { allowClipboardImage = false } = {}) {
+  if (!state.inlinePayloadCapture.active) return null;
+
+  const transformed = transformPasteBody(state, ctx, state.inlinePayloadCapture.buffer, { allowClipboardImage });
+  if (transformed?.data) {
+    resetInlinePayloadCapture(state);
+    return { data: transformed.data };
+  }
+
+  // Parse yakalayamadıysa, inline payload sinyali varken clipboard fallback ile marker üret.
+  if (containsLikelyInlineImagePayload(state.inlinePayloadCapture.buffer)) {
+    const fallback = copyClipboardImageToSessionCache(state, ctx);
+    if (fallback) {
+      resetInlinePayloadCapture(state);
+      return { data: fallback.marker };
+    }
+  }
+
+  return null;
 }
 
 function decodePastedPathToken(rawToken) {
@@ -496,7 +843,7 @@ function transformDroppedPasteText(state, ctx, pastedText) {
 
   const transformed = String(pastedText || "").replace(
     PASTED_TOKEN_PATTERN,
-    (token) => {
+    (fullMatch, leadingSpace, token) => {
       const decoded = decodePastedPathToken(token);
       const isPathToken = !!decoded && looksLikePathToken(decoded);
       const hintedMimeType = isPathToken ? toImageMimeType(path.resolve(decoded)) : "";
@@ -509,13 +856,13 @@ function transformDroppedPasteText(state, ctx, pastedText) {
       if (!entry) {
         if (isPathToken && hintedMimeType) {
           // Image path'i promptta ham bırakma: görünür path yerine boşluk bırak.
-          return "";
+          return leadingSpace || "";
         }
-        return token;
+        return fullMatch;
       }
       transformedCount += 1;
       markers.push(entry.marker);
-      return entry.marker;
+      return `${leadingSpace || ""}${entry.marker}`;
     },
   );
 
@@ -597,35 +944,142 @@ if (!image) {
   return { buffer, ext, mimeType };
 }
 
-function copyClipboardImageToSessionCache(state, ctx) {
-  const clipboardImage = readClipboardImageFromSystem();
-  if (!clipboardImage) return null;
+function writeImageBufferToCacheEntry(cache, entry, { buffer, mimeType, ext, sourcePrefix = "image" } = {}) {
+  if (!cache || !entry || !buffer || buffer.length === 0) return false;
+
+  const safeMimeType = normalizeImageMimeType(mimeType) || "image/png";
+  const safeExt = String(ext || toImageExtFromMimeType(safeMimeType) || "png")
+    .replace(/[^a-z0-9]/gi, "")
+    .toLowerCase() || "png";
+
+  const stampedName = `${sourcePrefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${safeExt}`;
+  const cachedPath = path.join(cache.dir, stampedName);
+
+  try {
+    fs.writeFileSync(cachedPath, buffer);
+  } catch {
+    return false;
+  }
+
+  entry.kind = "image";
+  entry.mimeType = safeMimeType;
+  entry.sourcePath = "";
+  entry.sourceSize = Number(buffer.length) || 0;
+  entry.sourceMtimeMs = Date.now();
+  entry.cachedPath = cachedPath;
+  entry.deferred = false;
+  if ("payloadText" in entry) {
+    entry.payloadText = "";
+  }
+
+  return true;
+}
+
+function copyImageBufferToSessionCache(state, ctx, { buffer, mimeType, ext, sourcePrefix = "image" } = {}) {
+  if (!buffer || buffer.length === 0) return null;
 
   const cache = ensureSessionDragCache(state, ctx);
   if (!cache) return null;
 
-  const marker = `[Image#${cache.nextImageIndex++}]`;
-  const stampedName = `clipboard-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${clipboardImage.ext}`;
-  const cachedPath = path.join(cache.dir, stampedName);
-
-  try {
-    fs.writeFileSync(cachedPath, clipboardImage.buffer);
-  } catch {
-    return null;
-  }
-
   const entry = {
-    marker,
+    marker: `[Image#${cache.nextImageIndex++}]`,
     kind: "image",
-    mimeType: clipboardImage.mimeType,
+    mimeType: normalizeImageMimeType(mimeType) || "image/png",
     sourcePath: "",
-    sourceSize: Number(clipboardImage.buffer.length) || 0,
+    sourceSize: 0,
     sourceMtimeMs: Date.now(),
-    cachedPath,
+    cachedPath: "",
+    deferred: false,
   };
 
-  cache.entriesByMarker.set(marker, entry);
+  const written = writeImageBufferToCacheEntry(cache, entry, { buffer, mimeType, ext, sourcePrefix });
+  if (!written) return null;
+
+  cache.entriesByMarker.set(entry.marker, entry);
   return entry;
+}
+
+function createDeferredInlineImageEntry(state, ctx, payloadText) {
+  const cache = ensureSessionDragCache(state, ctx);
+  if (!cache) return null;
+
+  const entry = {
+    marker: `[Image#${cache.nextImageIndex++}]`,
+    kind: "image",
+    mimeType: "image/png",
+    sourcePath: "",
+    sourceSize: 0,
+    sourceMtimeMs: Date.now(),
+    cachedPath: "",
+    deferred: true,
+    payloadText: String(payloadText || ""),
+  };
+
+  cache.entriesByMarker.set(entry.marker, entry);
+  return entry;
+}
+
+function materializeDeferredInlineImageEntry(cache, entry) {
+  if (!cache || !entry || !entry.deferred) return false;
+
+  const payloadText = String(entry.payloadText || "");
+  if (!payloadText) return false;
+
+  const payload = extractInlineImagePayloadFromText(payloadText)
+    || extractRawBase64ImagePayloadFromText(payloadText);
+  if (!payload) return false;
+
+  return writeImageBufferToCacheEntry(cache, entry, {
+    buffer: payload.buffer,
+    mimeType: payload.mimeType,
+    ext: payload.ext,
+    sourcePrefix: "deferred-inline",
+  });
+}
+
+function copyInlineImageJsonToSessionCache(state, ctx, text) {
+  const payload = extractInlineImagePayloadFromText(text);
+  if (!payload) return null;
+
+  return copyImageBufferToSessionCache(state, ctx, {
+    buffer: payload.buffer,
+    mimeType: payload.mimeType,
+    ext: payload.ext,
+    sourcePrefix: "inline-json",
+  });
+}
+
+function copyRawBase64ImageToSessionCache(state, ctx, text) {
+  const payload = extractRawBase64ImagePayloadFromText(text);
+  if (!payload) return null;
+
+  return copyImageBufferToSessionCache(state, ctx, {
+    buffer: payload.buffer,
+    mimeType: payload.mimeType,
+    ext: payload.ext,
+    sourcePrefix: "inline-b64",
+  });
+}
+
+function copyInlineImagePayloadToSessionCache(state, ctx, text) {
+  if (!ENABLE_CLIPBOARD_IMAGE_FLOW) return null;
+
+  return copyInlineImageJsonToSessionCache(state, ctx, text)
+    || copyRawBase64ImageToSessionCache(state, ctx, text);
+}
+
+function copyClipboardImageToSessionCache(state, ctx) {
+  if (!ENABLE_CLIPBOARD_IMAGE_FLOW) return null;
+
+  const clipboardImage = readClipboardImageFromSystem();
+  if (!clipboardImage) return null;
+
+  return copyImageBufferToSessionCache(state, ctx, {
+    buffer: clipboardImage.buffer,
+    mimeType: clipboardImage.mimeType,
+    ext: clipboardImage.ext,
+    sourcePrefix: "clipboard",
+  });
 }
 
 function normalizeBracketedPasteData(data) {
@@ -642,6 +1096,36 @@ function resetDropPasteCapture(state) {
 
 function transformPasteBody(state, ctx, text, { allowClipboardImage = false } = {}) {
   const normalizedText = normalizeBracketedPasteData(text);
+
+  const inlineImageEntry = copyInlineImagePayloadToSessionCache(state, ctx, normalizedText);
+  if (inlineImageEntry) {
+    if (ctx?.hasUI) {
+      ctx.ui.notify(`Inline image payload yakalandı ${inlineImageEntry.marker}`, "info");
+      ctx.ui.setStatus(DRAG_CACHE_STATUS_KEY, `Clipboard image ready · ${inlineImageEntry.marker}`);
+    }
+    return { data: inlineImageEntry.marker };
+  }
+
+  const looksInlinePayload = containsLikelyInlineImagePayload(normalizedText);
+  if (looksInlinePayload) {
+    const clipboardFallback = copyClipboardImageToSessionCache(state, ctx);
+    if (clipboardFallback) {
+      if (ctx?.hasUI) {
+        ctx.ui.notify(`Inline payload clipboard fallback ${clipboardFallback.marker}`, "info");
+        ctx.ui.setStatus(DRAG_CACHE_STATUS_KEY, `Clipboard image ready · ${clipboardFallback.marker}`);
+      }
+      return { data: clipboardFallback.marker };
+    }
+
+    const deferredEntry = createDeferredInlineImageEntry(state, ctx, normalizedText);
+    if (deferredEntry) {
+      if (ctx?.hasUI) {
+        ctx.ui.notify(`Inline payload deferred ${deferredEntry.marker}`, "info");
+        ctx.ui.setStatus(DRAG_CACHE_STATUS_KEY, `Inline payload deferred · ${deferredEntry.marker}`);
+      }
+      return { data: deferredEntry.marker };
+    }
+  }
 
   const result = transformDroppedPasteText(state, ctx, normalizedText);
   if (result.transformedCount > 0) {
@@ -678,7 +1162,36 @@ function transformTerminalInputForDropCache(state, ctx, data) {
     resetDropPasteCapture(state);
   }
 
+  if (
+    state.inlinePayloadCapture.active
+    && now - Number(state.inlinePayloadCapture.startedAt || 0) > INLINE_PAYLOAD_CAPTURE_STALE_MS
+  ) {
+    resetInlinePayloadCapture(state);
+  }
+
   const input = String(data);
+
+  if (state.inlinePayloadCapture.active) {
+    const drainUntil = Number(state.inlinePayloadCapture.drainUntil || 0);
+    if (drainUntil > now) {
+      // Marker basıldıktan sonra kalan paste chunk'larını kısa süre sessizce yut.
+      return { consume: true };
+    }
+
+    state.inlinePayloadCapture.buffer += input;
+
+    const resolved = tryResolveInlinePayloadCapture(state, ctx, { allowClipboardImage: false });
+    if (resolved) return resolved;
+
+    if (state.inlinePayloadCapture.buffer.length >= INLINE_PAYLOAD_CAPTURE_MAX_CHARS) {
+      // Büyük payload parse edilemediyse text'i kaybetme: normalize edip geri bas.
+      const fallback = normalizeBracketedPasteData(state.inlinePayloadCapture.buffer);
+      resetInlinePayloadCapture(state);
+      return fallback.length > 0 ? { data: fallback } : { consume: true };
+    }
+
+    return { consume: true };
+  }
 
   if (state.dropPasteCapture.active) {
     state.dropPasteCapture.buffer += input;
@@ -728,6 +1241,29 @@ function transformTerminalInputForDropCache(state, ctx, data) {
     return before.length > 0 ? { data: before } : { consume: true };
   }
 
+  if (looksLikeInlinePayloadCaptureStart(input)) {
+    // İlk chunk'ta mümkünse hemen marker üret; JSON/base64 ekranda görünmesin.
+    const immediate = copyInlineImagePayloadToSessionCache(state, ctx, input)
+      || copyClipboardImageToSessionCache(state, ctx);
+
+    if (immediate) {
+      state.inlinePayloadCapture.active = true;
+      state.inlinePayloadCapture.buffer = "";
+      state.inlinePayloadCapture.startedAt = now;
+      state.inlinePayloadCapture.drainUntil = now + 900;
+      return { data: immediate.marker };
+    }
+
+    state.inlinePayloadCapture.active = true;
+    state.inlinePayloadCapture.buffer = input;
+    state.inlinePayloadCapture.startedAt = now;
+    state.inlinePayloadCapture.drainUntil = 0;
+
+    const resolved = tryResolveInlinePayloadCapture(state, ctx, { allowClipboardImage: false });
+    if (resolved) return resolved;
+    return { consume: true };
+  }
+
   return transformPasteBody(state, ctx, input, { allowClipboardImage: false });
 }
 
@@ -756,6 +1292,11 @@ function materializeDragMarkersInPrompt(state, ctx, text, images) {
     }
 
     if (entry.kind === "image") {
+      if (entry.deferred) {
+        // Editor'da marker gösterip payload decode'u send anına ertelediğimiz durum.
+        materializeDeferredInlineImageEntry(activeCache, entry);
+      }
+
       try {
         const data = fs.readFileSync(entry.cachedPath).toString("base64");
         nextImages.push({
@@ -815,6 +1356,10 @@ function clearAllDragCaches(state) {
   state.dropPasteCapture.active = false;
   state.dropPasteCapture.buffer = "";
   state.dropPasteCapture.startedAt = 0;
+  state.inlinePayloadCapture.active = false;
+  state.inlinePayloadCapture.buffer = "";
+  state.inlinePayloadCapture.startedAt = 0;
+  state.inlinePayloadCapture.drainUntil = 0;
 }
 
 function emptyWindow(label) {
@@ -998,6 +1543,12 @@ function createState() {
       buffer: "",
       startedAt: 0,
     },
+    inlinePayloadCapture: {
+      active: false,
+      buffer: "",
+      startedAt: 0,
+      drainUntil: 0,
+    },
     openaiAccounts: [],
     activeOpenAIAccountId: null,
     swapPicker: {
@@ -1166,7 +1717,11 @@ export default function registerExtension(pi) {
     if (typeof ctx.ui.getEditorText !== "function" || typeof ctx.ui.setEditorText !== "function") return false;
 
     const currentText = String(ctx.ui.getEditorText() || "");
-    if (!currentText || !containsLikelyImagePath(currentText)) return false;
+    if (!currentText) return false;
+
+    const hasLikelyImagePath = containsLikelyImagePath(currentText);
+    const hasLikelyInlinePayload = containsLikelyInlineImagePayload(currentText);
+    if (!hasLikelyImagePath && !hasLikelyInlinePayload) return false;
 
     const now = Date.now();
     if (
@@ -1181,14 +1736,43 @@ export default function registerExtension(pi) {
     state.draftReconcile.inProgress = true;
 
     try {
+      const inlineEntry = hasLikelyInlinePayload
+        ? copyInlineImagePayloadToSessionCache(state, ctx, currentText)
+        : null;
+
+      if (inlineEntry) {
+        ctx.ui.setEditorText(inlineEntry.marker);
+        ctx.ui.notify(`Drag cache(${reason}): inline image -> ${inlineEntry.marker}`, "info");
+        ctx.ui.setStatus(DRAG_CACHE_STATUS_KEY, `Clipboard image ready · ${inlineEntry.marker}`);
+        return true;
+      }
+
+      if (hasLikelyInlinePayload) {
+        const clipboardFallback = copyClipboardImageToSessionCache(state, ctx);
+        if (clipboardFallback) {
+          ctx.ui.setEditorText(clipboardFallback.marker);
+          ctx.ui.notify(`Drag cache(${reason}): clipboard fallback -> ${clipboardFallback.marker}`, "info");
+          ctx.ui.setStatus(DRAG_CACHE_STATUS_KEY, `Clipboard image ready · ${clipboardFallback.marker}`);
+          return true;
+        }
+
+        const deferredEntry = createDeferredInlineImageEntry(state, ctx, currentText);
+        if (deferredEntry) {
+          ctx.ui.setEditorText(deferredEntry.marker);
+          ctx.ui.notify(`Drag cache(${reason}): deferred inline -> ${deferredEntry.marker}`, "info");
+          ctx.ui.setStatus(DRAG_CACHE_STATUS_KEY, `Inline payload deferred · ${deferredEntry.marker}`);
+          return true;
+        }
+      }
+
       const result = transformDroppedPasteText(state, ctx, currentText);
       if (result.transformed !== currentText) {
         ctx.ui.setEditorText(result.transformed);
         if (result.transformedCount > 0) {
           const preview = result.markers.slice(0, 3).join(" ");
           const suffix = result.markers.length > 3 ? " …" : "";
-          ctx.ui.notify(`Drag cache(${reason}): ${result.markers.length} dosya ${preview}${suffix}`, "info");
-          ctx.ui.setStatus(DRAG_CACHE_STATUS_KEY, `Drag cache active · ${result.markers.length} marker`);
+          ctx.ui.notify(`Drag cache(${reason}): ${result.transformedCount} dosya ${preview}${suffix}`, "info");
+          ctx.ui.setStatus(DRAG_CACHE_STATUS_KEY, `Drag cache active · ${result.transformedCount} marker`);
         }
         return true;
       }
@@ -1871,6 +2455,18 @@ export default function registerExtension(pi) {
     let changed = false;
 
     if (workingText) {
+      const inlineImageEntry = copyInlineImagePayloadToSessionCache(state, ctx, workingText);
+      if (inlineImageEntry) {
+        workingText = inlineImageEntry.marker;
+        changed = true;
+      } else if (containsLikelyInlineImagePayload(workingText)) {
+        const deferredEntry = createDeferredInlineImageEntry(state, ctx, workingText);
+        if (deferredEntry) {
+          workingText = deferredEntry.marker;
+          changed = true;
+        }
+      }
+
       const transformed = transformDroppedPasteText(state, ctx, workingText);
       if (transformed.transformedCount > 0) {
         workingText = transformed.transformed;
