@@ -5,7 +5,8 @@ A production-focused **gsd-pi extension** that combines four high-impact workflo
 - **Esc stop** for fast interruption (`Esc` → `/gsd stop`, `F4` fallback)
 - **OpenAI / OpenAI Codex WHAM usage footer** (`5h` + `7d` windows)
 - **OpenAI Codex multi-account switching** (`/swap`, `F2` account picker)
-- **Drag & drop screenshot/file cache** with stable markers like `[Image #1]`
+- **Drag & drop screenshot/file cache** with stable markers like `[Image#1]`
+- **Clipboard image paste (Cmd+V on macOS)** with markers like `[Image#1]`
 
 If you are searching for keywords like **"gsd extension"**, **"OpenAI Codex multi account"**, **"terminal drag and drop image to AI"**, **"Esc stop gsd"**, or **"ChatGPT WHAM usage footer"**, this project is built for that exact workflow.
 
@@ -45,13 +46,21 @@ If you are searching for keywords like **"gsd extension"**, **"OpenAI Codex mult
 - Intercepts dragged file paths in terminal input
 - Immediately copies files to extension-managed temp cache
 - Replaces raw paths with stable markers:
-  - Image files → `[Image #1]`, `[Image #2]`, ...
-  - Other files → `[File #1]`, `[File #2]`, ...
+  - Image files → `[Image#1]`, `[Image#2]`, ...
+  - Other files → `[File#1]`, `[File#2]`, ...
 - On prompt submit:
-  - `[Image #n]` becomes real image attachment for model input
-  - `[File #n]` resolves to cached stable temp path
+  - `[Image#n]` becomes real image attachment for model input
+  - `[File#n]` resolves to cached stable temp path
 - Marker resolution is resilient across task/session transitions in the same gsd run
 - Re-dragging from reused temp paths re-caches the newest file snapshot
+
+## 5) Clipboard Image Paste (macOS)
+
+- Detects bracketed paste flow from `Cmd+V`
+- If clipboard contains an image, saves it into temp cache and inserts marker
+- Inserts marker into prompt: `[Image#n]`
+- On send, marker is materialized as real image attachment
+- Works only for image clipboard payloads (text paste behavior is unchanged)
 
 ---
 
@@ -93,11 +102,18 @@ Then in active `gsd` terminal:
 ## D) Drag screenshot and ask question
 
 1. Drag screenshot file into terminal input
-2. Marker appears (for example `[Image #1]`)
+2. Marker appears (for example `[Image#1]`)
 3. Type your question and send
 4. Image is attached from stable cache
 
-## E) Inspect cached mappings
+## E) Paste image from clipboard (Cmd+V, macOS)
+
+1. Copy an image from any app
+2. Focus prompt input in gsd and press `Cmd+V`
+3. Marker appears (for example `[Image#1]`)
+4. Send prompt; image is attached from temp cache
+
+## F) Inspect cached mappings
 
 ```bash
 /dragcache
@@ -124,6 +140,12 @@ Then in active `gsd` terminal:
 - Check terminal keybinding conflicts
 - Ensure extension is installed (`gsd list`)
 - Use `F4` fallback
+
+## Clipboard image paste does not create marker
+
+- This flow is macOS-only (`Cmd+V` bracketed paste + system clipboard image)
+- Ensure clipboard currently contains an image (not file reference/text)
+- Run `/reload` after updating extension
 
 ## Dropped file remains raw path
 

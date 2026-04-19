@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { loginOpenAICodex, refreshOpenAICodexToken } from "@gsd/pi-ai/oauth";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@gsd/pi-tui";
 
@@ -22,9 +23,16 @@ const DRAG_CACHE_ROOT = path.join(os.tmpdir(), "gsd-drag-cache");
 const DROP_CAPTURE_STALE_MS = 2000;
 const MAX_DRAG_CACHES = 8;
 const LEGACY_F4_SEQUENCES = new Set(["\x1bOS", "\x1b[14~", "\x1b[[D"]);
-const STOP_SHORTCUT_KEY = Key.escape || Key.esc;
 const STOP_REQUEST_COOLDOWN_MS = 400;
 const STOP_STEER_RETRY_DELAY_MS = 120;
+const DROP_PATH_RETRY_ATTEMPTS = 6;
+const DROP_PATH_RETRY_ATTEMPTS_EPHEMERAL = 120;
+const DROP_PATH_RETRY_DELAY_MS = 25;
+const DRAFT_RECONCILE_INTERVAL_MS = 250;
+const DRAFT_RECONCILE_MIN_GAP_MS = 300;
+
+const MARKER_PATTERN = /\[(?:Image|File) ?#\d+\]|\[Image-(?:ClipBoard|Clipboard)#\d+\]/g;
+const PASTED_TOKEN_PATTERN = /'[^']+'|"[^"]+"|‘[^’]+’|“[^”]+”|['"“”‘’]?(?:~|\/|\.\.?\/)(?:\\.|[^\s'"“”‘’])+['"“”‘’]?/g;
 
 const IMAGE_MIME_BY_EXT = new Map([
   [".png", "image/png"],
@@ -50,9 +58,9 @@ function isF4Input(data) {
 }
 
 function isEscapeInput(data) {
-  if (typeof data !== "string" || data.length === 0) return false;
-  if (matchesKey(data, Key.escape) || matchesKey(data, Key.esc)) return true;
-  return data === "\x1b";
+  // Escape shortcut'ı sadece tek ESC tuş vuruşunda çalışsın.
+  // Bracketed paste başlangıcı (\x1b[200~) gibi ESC ile başlayan akışları stop'a çevirmemeliyiz.
+  return typeof data === "string" && data === "\x1b";
 }
 
 function isForceStopInput(data) {
@@ -237,7 +245,11 @@ function decodePastedPathToken(rawToken) {
     }
   }
 
+  // Bazı terminallerde token parçalanırken tek taraflı quote kalabiliyor.
+  token = token.replace(/^['"‘“]+/, "").replace(/['"’”]+$/, "");
+
   token = token.replace(/\\([\\\s'\"()\[\]{}])/g, "$1");
+  token = token.replace(/[;,]+$/, "");
 
   if (token.startsWith("~/")) {
     const home = process.env.HOME || process.env.USERPROFILE || "";
@@ -249,6 +261,66 @@ function decodePastedPathToken(rawToken) {
 
 function looksLikePathToken(decoded) {
   return decoded.startsWith("/") || decoded.startsWith("~/") || decoded.startsWith("./") || decoded.startsWith("../");
+}
+
+function containsLikelyImagePath(text) {
+  return /(?:^|\s)['"“”‘’]?(?:\/|~\/|\.\.?\/)[^\s'"“”‘’]+\.(?:png|jpe?g|gif|webp|bmp|tiff?|heic|heif)\b/i.test(String(text || ""));
+}
+
+function sleepMs(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return;
+  try {
+    const sab = new SharedArrayBuffer(4);
+    const arr = new Int32Array(sab);
+    Atomics.wait(arr, 0, 0, ms);
+  } catch {
+    // ignore if Atomics.wait is unavailable
+  }
+}
+
+function buildPathCandidates(decodedPath) {
+  const primary = path.resolve(decodedPath);
+  const candidates = [primary];
+
+  if (primary.startsWith("/var/")) {
+    candidates.push(`/private${primary}`);
+  } else if (primary.startsWith("/private/var/")) {
+    candidates.push(primary.replace("/private", ""));
+  }
+
+  return Array.from(new Set(candidates));
+}
+
+function getPathRetryAttempts(absolutePath) {
+  const normalized = String(absolutePath || "");
+  const isEphemeralTemp = normalized.startsWith("/var/folders/") || normalized.startsWith("/private/var/folders/");
+  return isEphemeralTemp ? DROP_PATH_RETRY_ATTEMPTS_EPHEMERAL : DROP_PATH_RETRY_ATTEMPTS;
+}
+
+function statPathWithRetry(decodedPath) {
+  const candidates = buildPathCandidates(decodedPath);
+
+  const absolute = path.resolve(decodedPath);
+  const maxAttempts = getPathRetryAttempts(absolute);
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    for (const candidatePath of candidates) {
+      try {
+        const stat = fs.statSync(candidatePath);
+        if (stat.isFile()) {
+          return { absolutePath: candidatePath, stat };
+        }
+      } catch {
+        // try next candidate / retry
+      }
+    }
+
+    if (attempt < maxAttempts - 1) {
+      sleepMs(DROP_PATH_RETRY_DELAY_MS);
+    }
+  }
+
+  return null;
 }
 
 function getCurrentSessionId(ctx) {
@@ -332,29 +404,32 @@ function findDragEntryByMarker(state, ctx, marker) {
   return null;
 }
 
+function resolveImageSourcePathWithRetry(sourcePath) {
+  const decoded = decodePastedPathToken(sourcePath);
+  if (!decoded || !looksLikePathToken(decoded)) return null;
+  return statPathWithRetry(decoded);
+}
+
 function copyDroppedPathToSessionCache(state, ctx, rawToken) {
   const decoded = decodePastedPathToken(rawToken);
   if (!decoded || !looksLikePathToken(decoded)) return null;
 
-  const absolutePath = path.resolve(decoded);
-  let stat;
-  try {
-    stat = fs.statSync(absolutePath);
-  } catch {
-    return null;
-  }
-
-  if (!stat.isFile()) return null;
-
   const cache = ensureSessionDragCache(state, ctx);
   if (!cache) return null;
 
-  const existing = cache.entriesBySourcePath.get(absolutePath);
+  const normalizedSourcePath = path.resolve(decoded);
+  const resolved = statPathWithRetry(decoded);
+  if (!resolved) return null;
+
+  const { absolutePath, stat } = resolved;
+  const existing = cache.entriesBySourcePath.get(absolutePath) || cache.entriesBySourcePath.get(normalizedSourcePath);
+
   if (existing) {
     const sameFileSnapshot =
       Number(existing.sourceSize) === Number(stat.size)
       && Number(existing.sourceMtimeMs) === Number(stat.mtimeMs)
       && typeof existing.cachedPath === "string"
+      && existing.cachedPath.length > 0
       && fs.existsSync(existing.cachedPath);
 
     if (sameFileSnapshot) return existing;
@@ -362,20 +437,40 @@ function copyDroppedPathToSessionCache(state, ctx, rawToken) {
 
   const mimeType = toImageMimeType(absolutePath);
   const kind = mimeType ? "image" : "file";
-  const marker = kind === "image"
-    ? `[Image #${cache.nextImageIndex++}]`
-    : `[File #${cache.nextFileIndex++}]`;
+  const marker = existing?.marker
+    || (kind === "image" ? `[Image#${cache.nextImageIndex++}]` : `[File#${cache.nextFileIndex++}]`);
 
   const sourceBase = path.basename(absolutePath);
   const safeBase = sanitizeFileName(sourceBase);
   const stampedName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeBase}`;
   const cachedPath = path.join(cache.dir, stampedName);
 
-  try {
-    fs.copyFileSync(absolutePath, cachedPath);
-  } catch {
-    return null;
+  const copyAttempts = getPathRetryAttempts(absolutePath);
+  let copied = false;
+  for (let attempt = 0; attempt < copyAttempts; attempt += 1) {
+    try {
+      fs.copyFileSync(absolutePath, cachedPath);
+      copied = true;
+      break;
+    } catch {
+      try {
+        const buffer = fs.readFileSync(absolutePath);
+        if (buffer?.length > 0) {
+          fs.writeFileSync(cachedPath, buffer);
+          copied = true;
+          break;
+        }
+      } catch {
+        // ignore read fallback failure
+      }
+
+      if (attempt < copyAttempts - 1) {
+        sleepMs(DROP_PATH_RETRY_DELAY_MS);
+      }
+    }
   }
+
+  if (!copied) return null;
 
   const entry = {
     marker,
@@ -385,9 +480,11 @@ function copyDroppedPathToSessionCache(state, ctx, rawToken) {
     sourceSize: Number(stat.size) || 0,
     sourceMtimeMs: Number(stat.mtimeMs) || 0,
     cachedPath,
+    deferred: false,
   };
 
   cache.entriesByMarker.set(marker, entry);
+  cache.entriesBySourcePath.set(normalizedSourcePath, entry);
   cache.entriesBySourcePath.set(absolutePath, entry);
   return entry;
 }
@@ -398,38 +495,155 @@ function transformDroppedPasteText(state, ctx, pastedText) {
   const markers = [];
 
   const transformed = String(pastedText || "").replace(
-    /'[^']+'|"[^"]+"|‘[^’]+’|“[^”]+”|(?:~|\/|\.\.?\/)(?:\\.|[^\s])+/g,
+    PASTED_TOKEN_PATTERN,
     (token) => {
       const decoded = decodePastedPathToken(token);
-      if (decoded && looksLikePathToken(decoded)) {
+      const isPathToken = !!decoded && looksLikePathToken(decoded);
+      const hintedMimeType = isPathToken ? toImageMimeType(path.resolve(decoded)) : "";
+
+      if (isPathToken) {
         attemptedPathCount += 1;
       }
 
       const entry = copyDroppedPathToSessionCache(state, ctx, token);
-      if (!entry) return token;
+      if (!entry) {
+        if (isPathToken && hintedMimeType) {
+          // Image path'i promptta ham bırakma: görünür path yerine boşluk bırak.
+          return "";
+        }
+        return token;
+      }
       transformedCount += 1;
       markers.push(entry.marker);
       return entry.marker;
     },
   );
 
-  if (attemptedPathCount > 0 && transformedCount === 0 && /\/var\/folders\//.test(String(pastedText || "")) && ctx?.hasUI) {
-    ctx.ui.setStatus(DRAG_CACHE_STATUS_KEY, "Drag path yakalandı ama dosya kopyalanamadı (muhtemelen silinmiş)");
+  if (attemptedPathCount > transformedCount && ctx?.hasUI) {
+    if (transformedCount === 0 && /\/var\/folders\//.test(String(pastedText || ""))) {
+      ctx.ui.setStatus(DRAG_CACHE_STATUS_KEY, "Drag path yakalandı ama dosya kopyalanamadı (muhtemelen silinmiş)");
+    } else {
+      ctx.ui.setStatus(
+        DRAG_CACHE_STATUS_KEY,
+        `Bazı dosyalar çevrilemedi (${transformedCount}/${attemptedPathCount}) · tekrar dene`,
+      );
+    }
   }
 
-  return { transformed, transformedCount, markers };
+  return { transformed, transformedCount, attemptedPathCount, markers };
 }
 
-function transformTerminalInputForDropCache(state, ctx, data) {
-  if (typeof data !== "string" || data.length === 0) return undefined;
+function readClipboardImageFromSystem() {
+  if (process.platform !== "darwin") return null;
 
-  // Bracketed paste marker'larını normalize et; bazı terminaller bu kontrol kodlarını
-  // parça parça gönderdiğinde önceki state machine marker dönüşümünü kaçırabiliyordu.
-  const normalized = String(data)
+  const jxaScript = `ObjC.import('AppKit');
+ObjC.import('Foundation');
+const pb = $.NSPasteboard.generalPasteboard;
+const image = $.NSImage.alloc.initWithPasteboard(pb);
+if (!image) {
+  console.log(JSON.stringify({ ok: false, reason: 'no-image' }));
+} else {
+  const tiffData = image.TIFFRepresentation;
+  if (!tiffData || Number(tiffData.length) <= 0) {
+    console.log(JSON.stringify({ ok: false, reason: 'no-image-data' }));
+  } else {
+    const rep = $.NSBitmapImageRep.imageRepWithData(tiffData);
+    const props = $.NSDictionary.dictionary;
+    const pngData = rep ? rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, props) : null;
+    const finalData = pngData && Number(pngData.length) > 0 ? pngData : tiffData;
+    const b64 = ObjC.unwrap(finalData.base64EncodedStringWithOptions(0));
+    console.log(JSON.stringify({ ok: true, ext: 'png', mime: 'image/png', b64 }));
+  }
+}`;
+
+  let stdout = "";
+  try {
+    stdout = execFileSync("osascript", ["-l", "JavaScript", "-e", jxaScript], {
+      encoding: "utf8",
+      maxBuffer: 32 * 1024 * 1024,
+    });
+  } catch {
+    return null;
+  }
+
+  const payload = String(stdout || "")
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .at(-1);
+
+  if (!payload) return null;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return null;
+  }
+
+  if (!parsed?.ok || !parsed?.b64) return null;
+
+  const ext = String(parsed.ext || "png").replace(/[^a-z0-9]/gi, "").toLowerCase() || "png";
+  const mimeType = String(parsed.mime || "image/png") || "image/png";
+
+  let buffer;
+  try {
+    buffer = Buffer.from(String(parsed.b64), "base64");
+  } catch {
+    return null;
+  }
+
+  if (!buffer || buffer.length === 0) return null;
+  return { buffer, ext, mimeType };
+}
+
+function copyClipboardImageToSessionCache(state, ctx) {
+  const clipboardImage = readClipboardImageFromSystem();
+  if (!clipboardImage) return null;
+
+  const cache = ensureSessionDragCache(state, ctx);
+  if (!cache) return null;
+
+  const marker = `[Image#${cache.nextImageIndex++}]`;
+  const stampedName = `clipboard-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${clipboardImage.ext}`;
+  const cachedPath = path.join(cache.dir, stampedName);
+
+  try {
+    fs.writeFileSync(cachedPath, clipboardImage.buffer);
+  } catch {
+    return null;
+  }
+
+  const entry = {
+    marker,
+    kind: "image",
+    mimeType: clipboardImage.mimeType,
+    sourcePath: "",
+    sourceSize: Number(clipboardImage.buffer.length) || 0,
+    sourceMtimeMs: Date.now(),
+    cachedPath,
+  };
+
+  cache.entriesByMarker.set(marker, entry);
+  return entry;
+}
+
+function normalizeBracketedPasteData(data) {
+  return String(data || "")
     .split(BRACKETED_PASTE_START).join("")
     .split(BRACKETED_PASTE_END).join("");
+}
 
-  const result = transformDroppedPasteText(state, ctx, normalized);
+function resetDropPasteCapture(state) {
+  state.dropPasteCapture.active = false;
+  state.dropPasteCapture.buffer = "";
+  state.dropPasteCapture.startedAt = 0;
+}
+
+function transformPasteBody(state, ctx, text, { allowClipboardImage = false } = {}) {
+  const normalizedText = normalizeBracketedPasteData(text);
+
+  const result = transformDroppedPasteText(state, ctx, normalizedText);
   if (result.transformedCount > 0) {
     if (ctx?.hasUI) {
       const preview = result.markers.slice(0, 3).join(" ");
@@ -440,11 +654,81 @@ function transformTerminalInputForDropCache(state, ctx, data) {
     return { data: result.transformed };
   }
 
-  if (normalized !== data) {
-    return { data: normalized };
+  // Normal path/drag akışında clipboard fallback devreye girmemeli.
+  // Sadece path token yoksa (örn. Cmd+V image raw payload) clipboard image dene.
+  if (allowClipboardImage && result.attemptedPathCount === 0) {
+    const clipboardEntry = copyClipboardImageToSessionCache(state, ctx);
+    if (clipboardEntry) {
+      if (ctx?.hasUI) {
+        ctx.ui.notify(`Clipboard image yakalandı ${clipboardEntry.marker}`, "info");
+        ctx.ui.setStatus(DRAG_CACHE_STATUS_KEY, `Clipboard image ready · ${clipboardEntry.marker}`);
+      }
+      return { data: clipboardEntry.marker };
+    }
   }
 
-  return undefined;
+  return normalizedText !== text ? { data: normalizedText } : undefined;
+}
+
+function transformTerminalInputForDropCache(state, ctx, data) {
+  if (typeof data !== "string" || data.length === 0) return undefined;
+
+  const now = Date.now();
+  if (state.dropPasteCapture.active && now - Number(state.dropPasteCapture.startedAt || 0) > DROP_CAPTURE_STALE_MS) {
+    resetDropPasteCapture(state);
+  }
+
+  const input = String(data);
+
+  if (state.dropPasteCapture.active) {
+    state.dropPasteCapture.buffer += input;
+    const endIndex = state.dropPasteCapture.buffer.indexOf(BRACKETED_PASTE_END);
+    if (endIndex < 0) return { consume: true };
+
+    const body = state.dropPasteCapture.buffer.slice(0, endIndex);
+    const trailing = state.dropPasteCapture.buffer.slice(endIndex + BRACKETED_PASTE_END.length);
+    resetDropPasteCapture(state);
+
+    const transformedBody = transformPasteBody(state, ctx, body, { allowClipboardImage: true });
+    const transformedTrailing = transformPasteBody(state, ctx, trailing, { allowClipboardImage: false });
+
+    const bodyText = transformedBody?.data ?? normalizeBracketedPasteData(body);
+    const trailingText = transformedTrailing?.data ?? normalizeBracketedPasteData(trailing);
+    const merged = `${bodyText}${trailingText}`;
+    return merged.length > 0 ? { data: merged } : { consume: true };
+  }
+
+  const startIndex = input.indexOf(BRACKETED_PASTE_START);
+  if (startIndex >= 0) {
+    const before = input.slice(0, startIndex);
+    const afterStart = input.slice(startIndex + BRACKETED_PASTE_START.length);
+    const endIndex = afterStart.indexOf(BRACKETED_PASTE_END);
+
+    if (endIndex >= 0) {
+      const body = afterStart.slice(0, endIndex);
+      const trailing = afterStart.slice(endIndex + BRACKETED_PASTE_END.length);
+
+      const transformedBefore = transformPasteBody(state, ctx, before, { allowClipboardImage: false });
+      const transformedBody = transformPasteBody(state, ctx, body, { allowClipboardImage: true });
+      const transformedTrailing = transformPasteBody(state, ctx, trailing, { allowClipboardImage: false });
+
+      const beforeText = transformedBefore?.data ?? normalizeBracketedPasteData(before);
+      const bodyText = transformedBody?.data ?? normalizeBracketedPasteData(body);
+      const trailingText = transformedTrailing?.data ?? normalizeBracketedPasteData(trailing);
+
+      return { data: `${beforeText}${bodyText}${trailingText}` };
+    }
+
+    state.dropPasteCapture.active = true;
+    state.dropPasteCapture.buffer = afterStart;
+    state.dropPasteCapture.startedAt = now;
+
+    const transformedBefore = transformPasteBody(state, ctx, before, { allowClipboardImage: false });
+    if (transformedBefore?.data != null) return { data: transformedBefore.data };
+    return before.length > 0 ? { data: before } : { consume: true };
+  }
+
+  return transformPasteBody(state, ctx, input, { allowClipboardImage: false });
 }
 
 function materializeDragMarkersInPrompt(state, ctx, text, images) {
@@ -455,7 +739,7 @@ function materializeDragMarkersInPrompt(state, ctx, text, images) {
   const nextImages = Array.isArray(images) ? [...images] : [];
   let changed = false;
 
-  const markersInPrompt = Array.from(new Set(nextText.match(/\[(?:Image|File) #\d+\]/g) || []));
+  const markersInPrompt = Array.from(new Set(nextText.match(MARKER_PATTERN) || []));
 
   for (const marker of markersInPrompt) {
     const located = findDragEntryByMarker(state, ctx, marker);
@@ -481,13 +765,19 @@ function materializeDragMarkersInPrompt(state, ctx, text, images) {
         });
         changed = true;
       } catch {
-        // Cached kopya silinmişse source path'ten tekrar materialize etmeyi dene.
+        // Cached kopya silinmişse/deferred entry ise source path'ten tekrar materialize etmeyi dene.
         try {
-          if (entry.sourcePath && fs.existsSync(entry.sourcePath)) {
-            const fallbackName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${sanitizeFileName(path.basename(entry.sourcePath))}`;
+          const resolvedSource = entry.sourcePath ? resolveImageSourcePathWithRetry(entry.sourcePath) : null;
+          if (resolvedSource?.absolutePath) {
+            const sourcePath = resolvedSource.absolutePath;
+            const fallbackName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${sanitizeFileName(path.basename(sourcePath))}`;
             const fallbackPath = path.join(activeCache.dir, fallbackName);
-            fs.copyFileSync(entry.sourcePath, fallbackPath);
+            fs.copyFileSync(sourcePath, fallbackPath);
             entry.cachedPath = fallbackPath;
+            entry.sourcePath = sourcePath;
+            entry.sourceSize = Number(resolvedSource.stat?.size) || entry.sourceSize || 0;
+            entry.sourceMtimeMs = Number(resolvedSource.stat?.mtimeMs) || entry.sourceMtimeMs || 0;
+            entry.deferred = false;
 
             const data = fs.readFileSync(entry.cachedPath).toString("base64");
             nextImages.push({
@@ -718,6 +1008,12 @@ function createState() {
       lastRequestedAt: 0,
       retryTimer: null,
     },
+    draftReconcile: {
+      timer: null,
+      inProgress: false,
+      lastText: "",
+      lastRunAt: 0,
+    },
     usage: {
       updatedAt: null,
       fiveHour: emptyWindow("5h"),
@@ -855,6 +1151,62 @@ export default function registerExtension(pi) {
       clearTimeout(state.stopControl.retryTimer);
       state.stopControl.retryTimer = null;
     }
+  };
+
+  const clearDraftReconcileTimer = () => {
+    if (state.draftReconcile.timer) {
+      clearInterval(state.draftReconcile.timer);
+      state.draftReconcile.timer = null;
+    }
+  };
+
+  const reconcileEditorImagePaths = (ctx, reason = "poll") => {
+    if (!ctx?.hasUI) return false;
+    if (state.draftReconcile.inProgress) return false;
+    if (typeof ctx.ui.getEditorText !== "function" || typeof ctx.ui.setEditorText !== "function") return false;
+
+    const currentText = String(ctx.ui.getEditorText() || "");
+    if (!currentText || !containsLikelyImagePath(currentText)) return false;
+
+    const now = Date.now();
+    if (
+      currentText === state.draftReconcile.lastText
+      && now - Number(state.draftReconcile.lastRunAt || 0) < DRAFT_RECONCILE_MIN_GAP_MS
+    ) {
+      return false;
+    }
+
+    state.draftReconcile.lastText = currentText;
+    state.draftReconcile.lastRunAt = now;
+    state.draftReconcile.inProgress = true;
+
+    try {
+      const result = transformDroppedPasteText(state, ctx, currentText);
+      if (result.transformed !== currentText) {
+        ctx.ui.setEditorText(result.transformed);
+        if (result.transformedCount > 0) {
+          const preview = result.markers.slice(0, 3).join(" ");
+          const suffix = result.markers.length > 3 ? " …" : "";
+          ctx.ui.notify(`Drag cache(${reason}): ${result.markers.length} dosya ${preview}${suffix}`, "info");
+          ctx.ui.setStatus(DRAG_CACHE_STATUS_KEY, `Drag cache active · ${result.markers.length} marker`);
+        }
+        return true;
+      }
+
+      return false;
+    } finally {
+      state.draftReconcile.inProgress = false;
+    }
+  };
+
+  const ensureDraftReconcileTimer = () => {
+    if (state.draftReconcile.timer) return;
+
+    state.draftReconcile.timer = setInterval(() => {
+      const liveCtx = state.ctx;
+      if (!liveCtx?.hasUI) return;
+      reconcileEditorImagePaths(liveCtx, "timer");
+    }, DRAFT_RECONCILE_INTERVAL_MS);
   };
 
   const requestImmediateStop = (ctx, sourceLabel = "shortcut") => {
@@ -1068,7 +1420,7 @@ export default function registerExtension(pi) {
       return { consume: true };
     }
 
-    if (matchesKey(data, Key.escape) || matchesKey(data, Key.esc)) {
+    if (isEscapeInput(data)) {
       closeSwapPicker();
       return { consume: true };
     }
@@ -1107,7 +1459,15 @@ export default function registerExtension(pi) {
         return { consume: true };
       }
 
-      return transformTerminalInputForDropCache(state, liveCtx, data);
+      const transformed = transformTerminalInputForDropCache(state, liveCtx, data);
+
+      // Bazı terminal/paste akışlarında path doğrudan editöre düşebilir.
+      // Aynı tick sonunda draft'i tarayıp image path'leri marker'a dönüştür.
+      queueMicrotask(() => {
+        reconcileEditorImagePaths(liveCtx, "terminal-input");
+      });
+
+      return transformed;
     });
   };
 
@@ -1339,16 +1699,8 @@ export default function registerExtension(pi) {
     state.openaiCodexProviderInstalled = true;
   };
 
-  pi.registerShortcut(STOP_SHORTCUT_KEY, {
-    description: "Stop current task immediately + /gsd stop",
-    handler: async (ctx) => {
-      if (state.swapPicker.active) {
-        closeSwapPicker();
-        return;
-      }
-      requestImmediateStop(ctx, "Esc");
-    },
-  });
+  // Esc built-in shortcut ile çakıştığı için registerShortcut kullanmıyoruz.
+  // Esc yakalama onTerminalInput içinden isForceStopInput ile devam eder.
 
   // F4 mevcut alışkanlıklar için fallback olarak bırakıldı.
   pi.registerShortcut(Key.f4, {
@@ -1526,7 +1878,15 @@ export default function registerExtension(pi) {
       }
     }
 
-    if (workingText.includes("[Image #") || workingText.includes("[File #")) {
+    if (
+      workingText.includes("[Image#")
+      || workingText.includes("[File#")
+      || workingText.includes("[Image #")
+      || workingText.includes("[File #")
+      || workingText.includes("[Image-Clipboard#")
+      || workingText.includes("[Image-ClipBoard#")
+    ) {
+
       const materialized = materializeDragMarkersInPrompt(state, ctx, workingText, workingImages);
       if (materialized.changed) {
         workingText = materialized.text;
@@ -1557,6 +1917,7 @@ export default function registerExtension(pi) {
     state.currentModel = ctx.model;
 
     installTerminalInputHandler(ctx);
+    ensureDraftReconcileTimer();
 
     ctx.ui.setFooter((tui, theme, footerData) => {
       state.requestRender = () => tui.requestRender();
@@ -1665,6 +2026,9 @@ export default function registerExtension(pi) {
     ensureSessionDragCache(state, ctx);
     syncOpenAIAccountsFromAuth(ctx, { upgradeLegacy: true });
     ensureTimer();
+    queueMicrotask(() => {
+      reconcileEditorImagePaths(ctx, "session-start");
+    });
     refreshUsage().catch(() => {});
   });
 
@@ -1674,6 +2038,9 @@ export default function registerExtension(pi) {
     installFooter(ctx);
     ensureSessionDragCache(state, ctx);
     syncOpenAIAccountsFromAuth(ctx);
+    queueMicrotask(() => {
+      reconcileEditorImagePaths(ctx, "session-switch");
+    });
     refreshUsage().catch(() => {});
   });
 
@@ -1691,6 +2058,9 @@ export default function registerExtension(pi) {
 
     ensureSessionDragCache(state, ctx);
     syncOpenAIAccountsFromAuth(ctx);
+    queueMicrotask(() => {
+      reconcileEditorImagePaths(ctx, "turn-start");
+    });
   });
 
   pi.on("model_select", (event, ctx) => {
@@ -1721,6 +2091,7 @@ export default function registerExtension(pi) {
 
   pi.on("session_shutdown", (_event, ctx) => {
     clearPendingStopRetry();
+    clearDraftReconcileTimer();
     clearTimer();
     closeSwapPicker();
 
@@ -1741,6 +2112,7 @@ export default function registerExtension(pi) {
   });
 
   process.once("exit", () => {
+    clearDraftReconcileTimer();
     clearAllDragCaches(state);
   });
 }
