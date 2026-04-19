@@ -23,6 +23,8 @@ const DROP_CAPTURE_STALE_MS = 2000;
 const MAX_DRAG_CACHES = 8;
 const LEGACY_F4_SEQUENCES = new Set(["\x1bOS", "\x1b[14~", "\x1b[[D"]);
 const STOP_SHORTCUT_KEY = Key.escape || Key.esc;
+const STOP_REQUEST_COOLDOWN_MS = 400;
+const STOP_STEER_RETRY_DELAY_MS = 120;
 
 const IMAGE_MIME_BY_EXT = new Map([
   [".png", "image/png"],
@@ -712,6 +714,10 @@ function createState() {
       active: false,
       selectedId: null,
     },
+    stopControl: {
+      lastRequestedAt: 0,
+      retryTimer: null,
+    },
     usage: {
       updatedAt: null,
       fiveHour: emptyWindow("5h"),
@@ -844,13 +850,34 @@ export default function registerExtension(pi) {
     if (typeof state.requestRender === "function") state.requestRender();
   };
 
+  const clearPendingStopRetry = () => {
+    if (state.stopControl.retryTimer) {
+      clearTimeout(state.stopControl.retryTimer);
+      state.stopControl.retryTimer = null;
+    }
+  };
+
   const requestImmediateStop = (ctx, sourceLabel = "shortcut") => {
+    const now = Date.now();
+    if (now - state.stopControl.lastRequestedAt < STOP_REQUEST_COOLDOWN_MS) {
+      return;
+    }
+    state.stopControl.lastRequestedAt = now;
+    clearPendingStopRetry();
+
     const tryAbort = () => {
       try {
         ctx?.abort?.();
       } catch {
-        // ignore abort errors; stop command still sent below
+        // ignore abort errors
       }
+    };
+
+    const sendStopIfBusy = () => {
+      const idle = !!ctx?.isIdle?.();
+      if (idle) return false;
+      pi.sendUserMessage("/gsd stop", { deliverAs: "steer" });
+      return true;
     };
 
     // İlk kesme denemesi + kısa aralıklı tekrarlar (tool call kilitlenmelerine karşı)
@@ -866,18 +893,24 @@ export default function registerExtension(pi) {
       tryAbort();
     }, 80);
 
+    const stopSent = sendStopIfBusy();
+
     if (ctx?.hasUI) {
-      ctx.ui.notify(`${sourceLabel}: aktif görev iptal ediliyor, /gsd stop gönderiliyor`, "warning");
-      ctx.ui.setStatus(STOP_STATUS_KEY, `${sourceLabel}: force-stop requested`);
+      const notifyText = stopSent
+        ? `${sourceLabel}: aktif görev iptal ediliyor, /gsd stop gönderiliyor`
+        : `${sourceLabel}: aktif görev iptal edildi`;
+      ctx.ui.notify(notifyText, "warning");
+      ctx.ui.setStatus(
+        STOP_STATUS_KEY,
+        stopSent ? `${sourceLabel}: force-stop requested` : `${sourceLabel}: abort requested`,
+      );
     }
 
-    // Abort çağrısı modeli keser; /gsd stop auto döngüyü kapatır.
-    pi.sendUserMessage("/gsd stop", { deliverAs: "steer" });
-
-    // Streaming state değişim yarışlarında komutu tekrar enjekte et.
-    setTimeout(() => {
-      pi.sendUserMessage("/gsd stop", { deliverAs: "steer" });
-    }, 120);
+    // Streaming state yarışlarında gerekirse bir kez daha dene; idle ise hiç gönderme.
+    state.stopControl.retryTimer = setTimeout(() => {
+      state.stopControl.retryTimer = null;
+      sendStopIfBusy();
+    }, STOP_STEER_RETRY_DELAY_MS);
   };
 
   const clearSwapPickerStatus = () => {
@@ -1309,6 +1342,10 @@ export default function registerExtension(pi) {
   pi.registerShortcut(STOP_SHORTCUT_KEY, {
     description: "Stop current task immediately + /gsd stop",
     handler: async (ctx) => {
+      if (state.swapPicker.active) {
+        closeSwapPicker();
+        return;
+      }
       requestImmediateStop(ctx, "Esc");
     },
   });
@@ -1666,6 +1703,7 @@ export default function registerExtension(pi) {
 
   pi.on("message_end", (_event, ctx) => {
     state.ctx = ctx;
+    clearPendingStopRetry();
     installTerminalInputHandler(ctx);
     ctx?.ui?.setStatus?.(STOP_STATUS_KEY, undefined);
     syncOpenAIAccountsFromAuth(ctx);
@@ -1674,6 +1712,7 @@ export default function registerExtension(pi) {
 
   pi.on("turn_end", (_event, ctx) => {
     state.ctx = ctx;
+    clearPendingStopRetry();
     installTerminalInputHandler(ctx);
     ctx?.ui?.setStatus?.(STOP_STATUS_KEY, undefined);
     syncOpenAIAccountsFromAuth(ctx);
@@ -1681,6 +1720,7 @@ export default function registerExtension(pi) {
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    clearPendingStopRetry();
     clearTimer();
     closeSwapPicker();
 
